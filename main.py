@@ -1,61 +1,120 @@
 import os
 import json
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from google.oauth2.service_account import Credentials
 import gspread
+from dotenv import load_dotenv
+from openai import OpenAI
 
-app = FastAPI(title="AI Calling Agent")
+load_dotenv()
 
-# Lazy globals
-_sheet = None
+app = FastAPI(title="AI Appointment Agent")
 
+# ---------- ENV ----------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-def get_sheet():
-    global _sheet
+# ---------- OpenAI ----------
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-    if _sheet is not None:
-        return _sheet
+# ---------- Google Sheets ----------
+gs_client = None
+sheet = None
 
-    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+if GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID:
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gs_client = gspread.authorize(creds)
+    sheet = gs_client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-    if not service_account_json:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing")
+# ---------- Models ----------
+class Appointment(BaseModel):
+    name: str
+    phone: str
+    date: str
 
-    if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEET_ID is missing")
+class AIRequest(BaseModel):
+    message: str
 
-    creds_dict = json.loads(service_account_json)
-
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-
-    client = gspread.authorize(creds)
-    _sheet = client.open_by_key(sheet_id).sheet1
-    return _sheet
-
-
+# ---------- Health ----------
 @app.get("/")
-def health():
+def root():
     return {"status": "ok", "message": "Service running"}
 
-
+# ---------- Debug ----------
 @app.get("/debug/env")
 def debug_env():
     return {
-        "GOOGLE_SERVICE_ACCOUNT_JSON": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")),
-        "GOOGLE_SHEET_ID": bool(os.getenv("GOOGLE_SHEET_ID")),
-        "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+        "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+        "GOOGLE_SERVICE_ACCOUNT_JSON": bool(GOOGLE_SERVICE_ACCOUNT_JSON),
+        "GOOGLE_SHEET_ID": bool(GOOGLE_SHEET_ID),
     }
 
-
+# ---------- Core Appointment ----------
 @app.post("/appointments")
-def create_appointment(name: str, phone: str, date: str):
+def create_appointment(data: Appointment):
+    if not sheet:
+        raise HTTPException(status_code=500, detail="Google Sheets not configured")
+
+    sheet.append_row([data.name, data.phone, data.date])
+    return {"status": "success", "message": "Appointment booked"}
+
+# ---------- AI AGENT ----------
+@app.post("/ai/appointment")
+def ai_appointment(req: AIRequest):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI not configured")
+
+    prompt = f"""
+You are an AI appointment setter.
+
+Extract:
+- name
+- phone
+- date
+
+If any field is missing, ask the user for it.
+
+User message:
+{req.message}
+
+Respond ONLY in JSON format like:
+{{
+  "name": "...",
+  "phone": "...",
+  "date": "..."
+}}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    content = response.choices[0].message.content
+
     try:
-        sheet = get_sheet()
-        sheet.append_row([name, phone, date])
-        return {"success": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {
+            "status": "need_info",
+            "message": "Please provide your name, phone number, and preferred date."
+        }
+
+    missing = [k for k in ["name", "phone", "date"] if not data.get(k)]
+    if missing:
+        return {
+            "status": "need_info",
+            "message": f"Please provide: {', '.join(missing)}"
+        }
+
+    sheet.append_row([data["name"], data["phone"], data["date"]])
+
+    return {
+        "status": "confirmed",
+        "message": "✅ Your appointment has been booked successfully!"
+    }
